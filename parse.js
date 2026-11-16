@@ -118,16 +118,17 @@ const BLOCK_LABEL = /(?!\s*\])(?:\\[\s\S]|[^\[\]\\\n]|\n(?![ \t]*\n))+/;
 
 const LHEADING_CORE = /^(?!bull |blockCode|fences|blockquote|heading|html|table)((?:.|\n(?!\s*?\n|bull |fences|blockquote|heading|hr|html|table))+?)\n {0,3}(=+|-+)[ \t]*(?:\n+|$)/;
 function buildLheading(tableFrag) {
-  return rx(LHEADING_CORE)
+  const r = rx(LHEADING_CORE)
     .sub(/bull/g, BULLET)
     .sub(/blockCode/g, /(?: {4}| {0,3}\t)/)
     .sub(/fences/g, / {0,3}(?:`{3,}|~{3,})/)
     .sub(/blockquote/g, / {0,3}>/)
     .sub(/heading/g, / {0,3}#{1,6}(?:\s|$)/)
     .sub(/hr/g, / {0,3}(?:(?:-[\t ]*){3,}|(?:_[\t ]*){3,}|(?:\*[\t ]*){3,})(?:\n+|$)/)
-    .sub(/html/g, / {0,3}<[^\n>]+>\n/)
-    .sub(/table/g, tableFrag)
-    .done();
+    .sub(/html/g, / {0,3}<[^\n>]+>\n/);
+  if (tableFrag) r.sub(/table/g, tableFrag);
+  else r.sub(/\|table/g, '');
+  return r.done();
 }
 const LHEADING = buildLheading('');
 
@@ -175,6 +176,27 @@ const GFM_TABLE = rx(
   .done();
 
 const LHEADING_GFM = buildLheading(/ {0,3}\|?(?:[:\- ]*\|)+[\:\- ]*\n/);
+
+// One combined test for the lines that can end a list item (fences,
+// heading, html block, blockquote, next bullet, hr) and one for the four
+// the previous line is checked against (fences, heading, html block, hr).
+// The indent in the pattern is the clamped cache index (0-3), as in the
+// single-purpose regexes above. Cached per indent, so a list pays for the
+// construction once.
+const _lineBeginCache = [[], []];
+function lineBeginRegex(ci, full) {
+  const arr = _lineBeginCache[full ? 1 : 0];
+  let re = arr[ci];
+  if (!re) {
+    const mid = '(?:```|~~~)|#{1,6}(?:\\s|$)|</?(?:' + TAG + ')(?: +|$|/?>)'
+      + '|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[';
+    const tail = '|((?:-[ \\t]*){3,}|(?:_[ \\t]*){3,}|(?:\\*[ \\t]*){3,})(?:\\n+|$))';
+    const extra = full ? '|>|(?:[*+-]|\\d{1,9}[.)])((?:[ \\t][^\\n]*)?(?:\\n|$))' : '';
+    re = new RegExp('^ {0,' + ci + '}(' + mid + extra + tail);
+    arr[ci] = re;
+  }
+  return re;
+}
 
 const PARA_CORE = /^([^\n]+(?:\n(?!hr|heading|lheading|blockquote|fences|list|html|table|[ \t]+\n)[^\n]+)*)/;
 function buildParagraph(listInterrupt, tableFrag) {
@@ -707,7 +729,8 @@ function tokList(S, src) {
     const firstLine = cap[2].split('\n', 1)[0];
     const bulletIndent = cap[1].length;
     let line = firstLine.replace(O.leadingSpaceTab, (whitespace) => expandTabs(whitespace, bulletIndent));
-    let nextLine = src.split('\n', 1)[0];
+    const nl0 = src.indexOf('\n');
+    let nextLine = nl0 === -1 ? src : src.slice(0, nl0);
     let blankLine = !line.trim();
 
     let indent = 0;
@@ -726,52 +749,46 @@ function tokList(S, src) {
     }
 
     if (!endEarly) {
-      const nextBulletRegex = O.nextBulletRegex(indent);
-      const hrRegex = O.hrRegex(indent);
-      const fencesBeginRegex = O.fencesBeginRegex(indent);
-      const headingBeginRegex = O.headingBeginRegex(indent);
-      const htmlBeginRegex = O.htmlBeginRegex(indent);
-      const blockquoteBeginRegex = O.blockquoteBeginRegex(indent);
+      const ci = Math.max(0, Math.min(3, indent - 1));
+      const beginAll = lineBeginRegex(ci, true);
+      const begin4 = lineBeginRegex(ci, false);
 
-      // Check if following lines should be included in List Item
-      while (src) {
-        const rawLine = src.split('\n', 1)[0];
-        let nextLineWithoutTabs;
+      // Walk the remaining lines by index instead of slicing and
+      // splitting the whole remainder once per line.
+      let pos = 0;
+      while (pos < src.length) {
+        const nl = src.indexOf('\n', pos);
+        const rawLine = nl === -1 ? src.slice(pos) : src.slice(pos, nl);
         nextLine = rawLine;
-        nextLineWithoutTabs = nextLine.replace(O.leadingSpaceTab, (whitespace) => expandTabs(whitespace));
+        const nextLineWithoutTabs = rawLine.includes('\t')
+          ? rawLine.replace(O.leadingSpaceTab, (whitespace) => expandTabs(whitespace))
+          : rawLine;
 
-        if (fencesBeginRegex.test(nextLine)) break; // code fences end item
-        if (headingBeginRegex.test(nextLine)) break; // heading ends item
-        if (htmlBeginRegex.test(nextLine)) break; // html block ends item
-        if (blockquoteBeginRegex.test(nextLine)) break; // blockquote ends item
-        if (nextBulletRegex.test(nextLine)) break; // new bullet ends item
-        if (hrRegex.test(nextLine)) break; // horizontal rule ends item
+        if (beginAll.test(nextLine)) break; // fences, heading, html, blockquote, bullet or hr end the item
 
-        if (nextLineWithoutTabs.search(O.nonSpaceChar) >= indent || !nextLine.trim()) { // dedent if possible
+        if (nextLineWithoutTabs.search(O.nonSpaceChar) >= indent || O.blankLine.test(nextLine)) { // dedent if possible
           itemContents += '\n' + nextLineWithoutTabs.slice(indent);
         } else {
           // not enough indentation
           if (blankLine) break;
           // paragraph continuation unless last line was a different block level element
-          if (line.replace(O.tabCharGlobal, '    ').search(O.nonSpaceChar) >= 4) break; // indented code block
-          if (fencesBeginRegex.test(line)) break;
-          if (headingBeginRegex.test(line)) break;
-          if (htmlBeginRegex.test(line)) break;
-          if (hrRegex.test(line)) break;
+          if ((line.includes('\t') ? line.replace(O.tabCharGlobal, '    ') : line).search(O.nonSpaceChar) >= 4) break; // indented code block
+          if (begin4.test(line)) break;
           // A lazy continuation can look like a setext underline after
           // list indentation is removed. Keep it in the paragraph.
           const setextContinuation = /^ {0,3}(?:=+|-+) *$/.test(nextLine)
-            && LHEADING.test(`${line}\n${nextLine}`);
+            && LHEADING_GFM.test(`${line}\n${nextLine}`);
           const continuation = setextContinuation
             ? `    ${nextLineWithoutTabs.replace(/^ {0,3}/, '')}`
             : nextLine;
           itemContents += '\n' + continuation;
         }
 
-        blankLine = !nextLine.trim();
-        src = src.substring(rawLine.length + 1);
+        blankLine = O.blankLine.test(nextLine);
+        pos = nl === -1 ? src.length : nl + 1;
         line = nextLineWithoutTabs.slice(indent);
       }
+      src = src.slice(pos);
     }
 
     // The loops above appended a '\n' the source may not have had. It could
@@ -933,6 +950,7 @@ function tokTable(S, src) {
 }
 
 function tokLheading(S, src) {
+  if (!/\n {0,3}[=-]/.test(src)) return undefined;
   const cap = LHEADING_GFM.exec(src);
   if (cap) {
     const text = cap[1].trim();
@@ -1127,7 +1145,7 @@ function blockTokens(S, src, tokens = [], lastParagraphClipped = false) {
 // Top-level lex: normalize line endings, run the block pass, then flush the
 // queued inline passes (link definitions are all known by then).
 function lex(S, src) {
-  src = src.replace(O.carriageReturn, '\n');
+  if (src.includes('\r')) src = src.replace(O.carriageReturn, '\n');
   const tokens = [];
   tokens.links = S.links;
   blockTokens(S, src, tokens);
@@ -1311,7 +1329,7 @@ function tokEmStrong(S, src, maskedSrc, prevChar = '') {
   const srcStart = maskedSrc.length - src.length;
   let runStart = srcStart;
   while (runStart > 0 && maskedSrc[runStart - 1] === delimChar) runStart--;
-  const runPrevChar = [...maskedSrc.slice(Math.max(0, runStart - 2), runStart)].at(-1) ?? '';
+  const runPrevChar = runStart > 0 ? maskedSrc[runStart - 1] : '';
   // The other delimiter character counts as punctuation here (`_**a*`)
   const runPrevPunct = runPrevChar === '*' || runPrevChar === '_' || !!PUNCTUATION.exec(runPrevChar);
   if (runStart < srcStart) prevChar = runPrevChar;
@@ -1512,8 +1530,9 @@ function tokUrl(S, src) {
   }
 }
 
+const INLINE_TEXT_TRIGGER = /[\\<!\[`*~_]|www\.|mailto:|xmpp:|\/\/|@| {2,}\n/;
 function tokInlineText(S, src) {
-  const cap = INLINE_TEXT.exec(src);
+  const cap = INLINE_TEXT_TRIGGER.test(src) ? INLINE_TEXT.exec(src) : [src];
   if (cap) {
     const escaped = S.inRawBlock;
     return {
@@ -1580,21 +1599,26 @@ function maskSrc(S, src) {
     maskedSrc = maskedSrc.replace(REFLINK_SEARCH, maskReflink);
   }
 
-  // Mask out escaped characters. `anyPunctuation` matches unicode
-  // punctuation, so an escaped astral character is 3 code units. A
-  // backslash inside a code span is literal, not an escape. Mask the
-  // backticks inside the span instead, so blockSkip still skips all of it.
-  maskedSrc = maskedSrc.replace(ANY_PUNCT_OUTSIDE_CODE, (match0, code, punct) => {
-    if (punct) return '+'.repeat(match0.length);
-    if (code) return code + match0.slice(code.length, -code.length).replace(/`/g, '+') + code;
-    return match0;
-  });
+  // Mask out escaped characters and other blocks. Both passes can only
+  // match when the source holds a backslash, a backtick, a '<' or a '[';
+  // one cheap test skips both whole-string replaces when it holds none.
+  // `anyPunctuation` matches unicode punctuation, so an escaped astral
+  // character is 3 code units. A backslash inside a code span is literal,
+  // not an escape. Mask the backticks inside the span instead, so
+  // blockSkip still skips all of it.
+  if (/[\\`<[]/.test(maskedSrc)) {
+    maskedSrc = maskedSrc.replace(ANY_PUNCT_OUTSIDE_CODE, (match0, code, punct) => {
+      if (punct) return '+'.repeat(match0.length);
+      if (code) return code + match0.slice(code.length, -code.length).replace(/`/g, '+') + code;
+      return match0;
+    });
 
-  // Mask out other blocks
-  maskedSrc = maskedSrc.replace(BLOCK_SKIP, (match0, _link, context) => {
-    const offset = context ? context.length : 0;
-    return match0.slice(0, offset) + '[' + 'a'.repeat(match0.length - offset - 2) + ']';
-  });
+    // Mask out other blocks
+    maskedSrc = maskedSrc.replace(BLOCK_SKIP, (match0, _link, context) => {
+      const offset = context ? context.length : 0;
+      return match0.slice(0, offset) + '[' + 'a'.repeat(match0.length - offset - 2) + ']';
+    });
+  }
 
   return maskedSrc;
 }
