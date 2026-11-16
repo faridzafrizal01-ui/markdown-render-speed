@@ -1599,21 +1599,22 @@ function maskSrc(S, src) {
     maskedSrc = maskedSrc.replace(REFLINK_SEARCH, maskReflink);
   }
 
-  // Mask out escaped characters and other blocks. Both passes can only
-  // match when the source holds a backslash, a backtick, a '<' or a '[';
-  // one cheap test skips both whole-string replaces when it holds none.
-  // `anyPunctuation` matches unicode punctuation, so an escaped astral
-  // character is 3 code units. A backslash inside a code span is literal,
-  // not an escape. Mask the backticks inside the span instead, so
-  // blockSkip still skips all of it.
-  if (/[\\`<[]/.test(maskedSrc)) {
+  // Mask out escaped characters and other blocks. Each pass has its own
+  // cheap trigger test, so a run with only one kind of content skips the
+  // other whole-string replace. `anyPunctuation` matches unicode
+  // punctuation, so an escaped astral character is 3 code units. A
+  // backslash inside a code span is literal, not an escape. Mask the
+  // backticks inside the span instead, so blockSkip still skips all of it.
+  if (/[\\`]/.test(maskedSrc)) {
     maskedSrc = maskedSrc.replace(ANY_PUNCT_OUTSIDE_CODE, (match0, code, punct) => {
       if (punct) return '+'.repeat(match0.length);
       if (code) return code + match0.slice(code.length, -code.length).replace(/`/g, '+') + code;
       return match0;
     });
+  }
 
-    // Mask out other blocks
+  // Mask out other blocks
+  if (/[`<[]/.test(maskedSrc)) {
     maskedSrc = maskedSrc.replace(BLOCK_SKIP, (match0, _link, context) => {
       const offset = context ? context.length : 0;
       return match0.slice(0, offset) + '[' + 'a'.repeat(match0.length - offset - 2) + ']';
@@ -1643,15 +1644,18 @@ function inlineTokens(S, src, tokens = []) {
 
 function inlineTokensInner(S, src, tokens) {
   // The masked source is only read by emStrong and del, which need a *,
-  // _ or ~ to start. Skip building it for a run without one.
-  const maskedSrc = src.includes('*') || src.includes('_') || src.includes('~')
-    ? maskSrc(S, src)
-    : src;
+  // _ or ~ to start. One test replaces three includes(), and when the run
+  // holds no delimiter at all the closer scan is skipped too: masking
+  // never introduces a delimiter, so every closer index is -1 then.
+  const hasDelim = /[*_~]/.test(src);
+  const maskedSrc = hasDelim ? maskSrc(S, src) : src;
 
   // One scan of this maskedSrc for the last emphasis, strong, and
   // strikethrough closers, shared by every opener in the pass.
   const prevFrame = S.closerFrame;
-  S.closerFrame = { maskedSrc, ...scanClosers(maskedSrc) };
+  S.closerFrame = hasDelim
+    ? { maskedSrc, ...scanClosers(maskedSrc) }
+    : { maskedSrc, lastEm: { '*': -1, _: -1 }, lastDel: -1 };
   try {
     return tokenizeInlines(S, src, maskedSrc, tokens);
   } finally {
@@ -1675,81 +1679,93 @@ function tokenizeInlines(S, src, maskedSrc, tokens) {
     keepPrevChar = false;
 
     let token;
-
-    // escape
-    if (token = tokEscape(S, src)) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    // tag
-    if (token = tokTag(S, src)) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    // link
-    if (token = tokLink(S, src)) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    // reflink, nolink
-    if (token = tokReflink(S, src)) {
-      src = src.substring(token.raw.length);
-      const lastToken = tokens.at(-1);
-      if (token.type === 'text' && lastToken?.type === 'text') {
-        lastToken.raw += token.raw;
-        lastToken.text += token.text;
-      } else {
+    // Dispatch on the first character: each tokenizer can only match at
+    // positions starting with its own opener, so a plain-text position
+    // skips the failing regexes outright. The order inside each branch
+    // is the grammar's order, and anything that cannot match falls
+    // through to text.
+    const c0 = src.charCodeAt(0);
+    if (c0 === 92) { // backslash: escape, then hard break
+      if (token = tokEscape(S, src)) {
+        src = src.substring(token.raw.length);
         tokens.push(token);
+        continue;
       }
-      continue;
-    }
-
-    // em & strong
-    if (token = tokEmStrong(S, src, maskedSrc, prevChar)) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    // code
-    if (token = tokCodespan(S, src)) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    // br
-    if (token = tokBr(S, src)) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    // del (gfm)
-    if (token = tokDel(S, src, maskedSrc, prevChar)) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    // autolink
-    if (token = tokAutolink(S, src)) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    // url (gfm)
-    if (!S.inLink && (token = tokUrl(S, src))) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
+      if (token = tokBr(S, src)) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
+    } else if (c0 === 60) { // <: tag, then autolink
+      if (token = tokTag(S, src)) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
+      if (token = tokAutolink(S, src)) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
+    } else if (c0 === 91 || c0 === 33) { // [ or !: link, then reflink
+      if (token = tokLink(S, src)) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
+      if (token = tokReflink(S, src)) {
+        src = src.substring(token.raw.length);
+        const lastToken = tokens.at(-1);
+        if (token.type === 'text' && lastToken?.type === 'text') {
+          lastToken.raw += token.raw;
+          lastToken.text += token.text;
+        } else {
+          tokens.push(token);
+        }
+        continue;
+      }
+    } else if (c0 === 42) { // *: em & strong
+      if (token = tokEmStrong(S, src, maskedSrc, prevChar)) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
+    } else if (c0 === 95) { // _: em & strong, then extended autolink
+      if (token = tokEmStrong(S, src, maskedSrc, prevChar)) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
+      if (!S.inLink && (token = tokUrl(S, src))) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
+    } else if (c0 === 96) { // backtick: code span
+      if (token = tokCodespan(S, src)) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
+    } else if (c0 === 126) { // ~: strikethrough
+      if (token = tokDel(S, src, maskedSrc, prevChar)) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
+    } else if (c0 === 32) { // space: hard break
+      if (token = tokBr(S, src)) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
+    } else if ((c0 >= 48 && c0 <= 57) || (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122) || c0 === 46 || c0 === 43 || c0 === 45) {
+      // letter, digit, '.', '+' or '-': extended autolink, then text
+      if (!S.inLink && (token = tokUrl(S, src))) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
     }
 
     // text
