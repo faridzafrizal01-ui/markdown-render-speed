@@ -1366,7 +1366,7 @@ function tokEmStrong(S, src, maskedSrc, prevChar = '') {
 
       if (!rDelim) continue; // skip single * in __abc*abc__
 
-      rLength = [...rDelim].length;
+      rLength = rDelim.length;
 
       if (match[3] || match[4]) { // found another Left Delim
         delimTotal += rLength;
@@ -1450,7 +1450,7 @@ function tokDel(S, src, maskedSrc, prevChar = '') {
 
       if (!rDelim) continue;
 
-      rLength = [...rDelim].length;
+      rLength = rDelim.length;
 
       if (rLength !== lLength) continue;
 
