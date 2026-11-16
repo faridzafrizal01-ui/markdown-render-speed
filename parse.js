@@ -251,7 +251,8 @@ const O = {
   leadingSpaceTab: /^[ \t]+/,
   multipleSpaceGlobal: /\s+/g,
   blankLine: /^[ \t]*$/,
-  doubleBlankLine: /\n[ \t]*\n[ \t]*$/,
+  // A setext underline line inside a paragraph's text.
+  lheadingProbe: /\n {0,3}(=+|-+)[ \t]*(?:\n|$)/,
   blockquoteStart: /^ {0,3}>/,
   // Neutralise a lazy setext underline (one may end with tabs).
   blockquoteSetextReplace: /\n {0,3}((?:=+|-+)[ \t]*)(?=\n|$)/g,
@@ -615,6 +616,19 @@ const INLINE_TEXT_GFM = compose(
   ],
 );
 
+// The stops for a plain-text run, as one regex: a special character,
+// a URL scheme, a `www.` with a valid start, a hard-break run, a
+// character before a mailto:/xmpp: or an email address. The first
+// three (and the hard-break run) end the text where they start; the
+// character before a mailto: or an email belongs to the text, so
+// those end one past the match. Groups 1-3 are the former, 4-5 the
+// latter; the hard-break run matches empty.
+const INLINE_TEXT_STOP = /([\\<!\[`*~_])|((?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/)|((?<![^\s*_~(])www\.)|(?= {2,}\n)|([^a-zA-Z0-9](?=(?:mailto|xmpp):))|([^a-zA-Z0-9.!#$%&'*+\/=?_`{\|}~-](?=[a-zA-Z0-9.!#$%&'*+\/=?_`{\|}~-]+@))/g;
+// An email address starting at the search position (sticky): the one
+// immediate stop after the first unit that the scan below cannot
+// see, since it needs the character before the address.
+const INLINE_EMAIL_START = /[a-zA-Z0-9.!#$%&'*+\/=?_`{\|}~-]+@/y;
+
 const INLINE = {
   _backpedal: URL_BACKPEDAL,
   anyPunctuation: ANY_PUNCTUATION,
@@ -672,12 +686,13 @@ function infiniteLoopError(byte) {
   throw new Error('Infinite loop on byte: ' + byte);
 }
 
-/** Queue an inline string for later tokenising; returns the (still
- *  empty) token array the block token will carry. */
-function queueInline(ctx, src) {
-  const tokens = [];
-  ctx.inlineQueue.push({ src, tokens });
-  return tokens;
+/** Queue an inline string for later rendering. `holder` is the block
+ *  token (or table cell) whose `html` field the inline phase will fill
+ *  with the rendered string. Nothing is tokenised yet: inline runs
+ *  only start once every block, and therefore every link reference
+ *  definition, is known. */
+function queueInline(ctx, src, holder) {
+  ctx.inlineQueue.push({ src, holder });
 }
 
 /* ------------------------------------------------------------------ */
@@ -732,13 +747,15 @@ function tokenizeHeading(ctx, src) {
       const trimmed = rtrim(text, '#');
       if (!trimmed || O.endingSpaceTabChar.test(trimmed)) text = trimmed.trim();
     }
-    return {
+    const token = {
       type: 'heading',
       raw: rtrim(cap[0], '\n'),
       depth: cap[1].length,
       text,
-      tokens: queueInline(ctx, text),
+      html: '',
     };
+    queueInline(ctx, text, token);
+    return token;
   }
 }
 
@@ -959,7 +976,7 @@ function tokenizeList(ctx, src) {
 
     if (!list.loose) {
       if (endsWithBlankLine) list.loose = true;
-      else if (O.doubleBlankLine.test(raw)) endsWithBlankLine = true;
+      else if (hasTrailingBlankLine(raw)) endsWithBlankLine = true;
     }
 
     list.items.push({
@@ -1020,16 +1037,16 @@ function tokenizeList(ctx, src) {
         };
         item.checked = checkboxToken.checked;
         if (list.loose) {
-          if (item.tokens[0] && ['paragraph', 'text'].includes(item.tokens[0].type) && 'tokens' in item.tokens[0] && item.tokens[0].tokens) {
-            item.tokens[0].raw = checkboxToken.raw + item.tokens[0].raw;
-            item.tokens[0].text = checkboxToken.raw + item.tokens[0].text;
-            item.tokens[0].tokens.unshift(checkboxToken);
+          if (item.tokens[0] && (item.tokens[0].type === 'paragraph' || item.tokens[0].type === 'text')) {
+            // The checkbox renders first inside the paragraph's inline
+            // content; the inline phase prepends its HTML.
+            item.tokens[0].leadCheckbox = checkboxToken;
           } else {
             item.tokens.unshift({
               type: 'paragraph',
               raw: checkboxToken.raw,
               text: checkboxToken.raw,
-              tokens: [checkboxToken],
+              html: checkboxHtml(checkboxToken.checked),
             });
           }
         } else {
@@ -1102,20 +1119,26 @@ function tokenizeTable(ctx, src) {
     else item.align.push(null);
   }
   for (let i = 0; i < headers.length; i++) {
-    item.header.push({
+    const cell = {
       text: headers[i],
-      tokens: queueInline(ctx, headers[i]),
+      html: '',
       header: true,
       align: item.align[i],
-    });
+    };
+    queueInline(ctx, headers[i], cell);
+    item.header.push(cell);
   }
   for (const row of rows) {
-    item.rows.push(splitCells(row, item.header.length).map((cell, i) => ({
-      text: cell,
-      tokens: queueInline(ctx, cell),
-      header: false,
-      align: item.align[i],
-    })));
+    item.rows.push(splitCells(row, item.header.length).map((cellText, i) => {
+      const cell = {
+        text: cellText,
+        html: '',
+        header: false,
+        align: item.align[i],
+      };
+      queueInline(ctx, cellText, cell);
+      return cell;
+    }));
   }
   return item;
 }
@@ -1124,28 +1147,107 @@ function tokenizeLheading(ctx, src) {
   const cap = BLOCK.lheading.exec(src);
   if (cap) {
     const text = cap[1].trim();
-    return {
+    const token = {
       type: 'heading',
       raw: rtrim(cap[0], '\n'),
       depth: cap[2].charAt(0) === '=' ? 1 : 2,
       text,
-      tokens: queueInline(ctx, text),
+      html: '',
     };
+    queueInline(ctx, text, token);
+    return token;
   }
 }
 
-function tokenizeParagraph(ctx, src) {
-  const cap = BLOCK.paragraph.exec(src);
-  if (cap) {
-    const text = cap[1].charAt(cap[1].length - 1) === '\n' ? cap[1].slice(0, -1) : cap[1];
-    return { type: 'paragraph', raw: cap[0], text, tokens: queueInline(ctx, text) };
+/** Build a paragraph token from a paragraph-regex match and queue
+ *  its inline content. Split from the regex so the setext probe in
+ *  blockTokens can run the regex once and decide about the heading
+ *  before any inline content is queued. */
+function paragraphToken(ctx, cap) {
+  const text = cap[1].charAt(cap[1].length - 1) === '\n' ? cap[1].slice(0, -1) : cap[1];
+  const token = { type: 'paragraph', raw: cap[0], text, html: '' };
+  queueInline(ctx, text, token);
+  return token;
+}
+
+/** The paragraph ended at `offset`; the line there stopped it. Could
+ *  a setext underline lie at or just past that line? Three ways: the
+ *  stopped-at line is itself an underline (`---`, which is also a
+ *  thematic break); it starts with `<` (an html line the paragraph
+ *  stops at but a setext text may cross, since a bare tag line has
+ *  no `>`); or it is a table header whose delimiter line is a bare
+ *  dashes line, which is both delimiter and underline. */
+function lheadingAfterParagraph(src, offset) {
+  // The paragraph's text ends just before the newline that precedes
+  // the stopped-at line; skip it so line 1 is that line.
+  if (src.charCodeAt(offset) === 10) offset++;
+  const i = offset;
+  const line1End = src.indexOf('\n', i);
+  const end1 = line1End === -1 ? src.length : line1End;
+  // The stopped-at line is itself an underline.
+  if (isUnderlineLine(src, i, end1)) return true;
+  // An html line: the underline may lie past it.
+  let k = i;
+  while (k < i + 3 && src.charCodeAt(k) === 32) k++;
+  if (src.charCodeAt(k) === 60) return true;
+  // A table header whose delimiter is a bare dashes line.
+  if (line1End !== -1) {
+    let m = i;
+    while (m < end1 && (src.charCodeAt(m) === 32 || src.charCodeAt(m) === 9)) m++;
+    if (m < end1) {
+      const line2Start = line1End + 1;
+      const line2End = src.indexOf('\n', line2Start);
+      const end2 = line2End === -1 ? src.length : line2End;
+      if (isDashesLine(src, line2Start, end2)) return true;
+    }
   }
+  return false;
+}
+
+/** Is `src[start..end)` (one line, without its newline) a setext
+ *  underline: up to three spaces, then only `=` or only `-`, then
+ *  only spaces or tabs? */
+function isUnderlineLine(src, start, end) {
+  let i = start;
+  while (i < start + 3 && src.charCodeAt(i) === 32) i++;
+  if (i >= end) return false;
+  const ch = src.charCodeAt(i);
+  if (ch !== 61 && ch !== 45) return false; // = or -
+  while (i < end && src.charCodeAt(i) === ch) i++;
+  while (i < end && (src.charCodeAt(i) === 32 || src.charCodeAt(i) === 9)) i++;
+  return i === end;
+}
+
+/** Is `src[start..end)` a bare dashes line (the table-delimiter /
+ *  setext-underline overlap)? */
+function isDashesLine(src, start, end) {
+  let i = start;
+  while (i < start + 3 && src.charCodeAt(i) === 32) i++;
+  if (i >= end || src.charCodeAt(i) !== 45) return false;
+  while (i < end && src.charCodeAt(i) === 45) i++;
+  while (i < end && (src.charCodeAt(i) === 32 || src.charCodeAt(i) === 9)) i++;
+  return i === end;
+}
+
+/** Does `raw` end with a blank line: a newline, only spaces or
+ *  tabs, another newline, only spaces or tabs, then the end? (The
+ *  manual form of /\n[ \t]*\n[ \t]*$/ — the regex scans the whole
+ *  raw text, this only walks its tail.) */
+function hasTrailingBlankLine(raw) {
+  let i = raw.length;
+  while (i > 0 && (raw.charCodeAt(i - 1) === 32 || raw.charCodeAt(i - 1) === 9)) i--;
+  if (i === 0 || raw.charCodeAt(i - 1) !== 10) return false;
+  i--;
+  while (i > 0 && (raw.charCodeAt(i - 1) === 32 || raw.charCodeAt(i - 1) === 9)) i--;
+  return i > 0 && raw.charCodeAt(i - 1) === 10;
 }
 
 function tokenizeText(ctx, src) {
   const cap = BLOCK.text.exec(src);
   if (cap) {
-    return { type: 'text', raw: cap[0], text: cap[0], tokens: queueInline(ctx, cap[0]) };
+    const token = { type: 'text', raw: cap[0], text: cap[0], html: '' };
+    queueInline(ctx, cap[0], token);
+    return token;
   }
 }
 
@@ -1171,8 +1273,21 @@ function blockTokens(ctx, src, tokens = [], lastParagraphClipped = false) {
 
     let token;
 
+    // First-char dispatch: most block markers allow up to three
+    // leading spaces, so the significant character is the first
+    // non-space within them (`sig` is its index, or 3 when the line
+    // starts with four or more spaces, which is indented-code
+    // territory). A tokenizer whose marker cannot start there is
+    // skipped; the trial order among the rest is unchanged.
+    const ch0 = src.charCodeAt(0);
+    let sig = 0;
+    if (ch0 === 32) {
+      while (sig < 3 && src.charCodeAt(sig) === 32) sig++;
+    }
+    const sigCh = src.charCodeAt(sig);
+
     // newline
-    if (token = tokenizeSpace(ctx, src)) {
+    if ((ch0 === 32 || ch0 === 9 || ch0 === 10) && (token = tokenizeSpace(ctx, src))) {
       src = src.substring(token.raw.length);
       const lastToken = tokens.at(-1);
       if (token.raw.length === 1 && lastToken !== undefined) {
@@ -1186,7 +1301,7 @@ function blockTokens(ctx, src, tokens = [], lastParagraphClipped = false) {
     }
 
     // indented code
-    if (token = tokenizeCode(ctx, src)) {
+    if ((sigCh === 32 || sigCh === 9) && (token = tokenizeCode(ctx, src))) {
       src = src.substring(token.raw.length);
       const lastToken = tokens.at(-1);
       if (lastToken?.type === 'paragraph' || lastToken?.type === 'text') {
@@ -1200,49 +1315,50 @@ function blockTokens(ctx, src, tokens = [], lastParagraphClipped = false) {
     }
 
     // fenced code
-    if (token = tokenizeFences(ctx, src)) {
+    if ((sigCh === 96 || sigCh === 126) && (token = tokenizeFences(ctx, src))) {
       src = src.substring(token.raw.length);
       tokens.push(token);
       continue;
     }
 
     // ATX heading
-    if (token = tokenizeHeading(ctx, src)) {
+    if (sigCh === 35 && (token = tokenizeHeading(ctx, src))) {
       src = src.substring(token.raw.length);
       tokens.push(token);
       continue;
     }
 
     // thematic break
-    if (token = tokenizeHr(ctx, src)) {
+    if ((sigCh === 45 || sigCh === 95 || sigCh === 42) && (token = tokenizeHr(ctx, src))) {
       src = src.substring(token.raw.length);
       tokens.push(token);
       continue;
     }
 
     // blockquote
-    if (token = tokenizeBlockquote(ctx, src)) {
+    if (sigCh === 62 && (token = tokenizeBlockquote(ctx, src))) {
       src = src.substring(token.raw.length);
       tokens.push(token);
       continue;
     }
 
     // list
-    if (token = tokenizeList(ctx, src)) {
+    if ((sigCh === 42 || sigCh === 43 || sigCh === 45 || (sigCh >= 48 && sigCh <= 57))
+      && (token = tokenizeList(ctx, src))) {
       src = src.substring(token.raw.length);
       tokens.push(token);
       continue;
     }
 
     // raw HTML block
-    if (token = tokenizeHtml(ctx, src)) {
+    if (sigCh === 60 && (token = tokenizeHtml(ctx, src))) {
       src = src.substring(token.raw.length);
       tokens.push(token);
       continue;
     }
 
     // link reference definition
-    if (token = tokenizeDef(ctx, src)) {
+    if (sigCh === 91 && (token = tokenizeDef(ctx, src))) {
       src = src.substring(token.raw.length);
       const lastToken = tokens.at(-1);
       if (lastToken?.type === 'paragraph' || lastToken?.type === 'text') {
@@ -1268,27 +1384,55 @@ function blockTokens(ctx, src, tokens = [], lastParagraphClipped = false) {
       continue;
     }
 
-    // setext heading
-    if (token = tokenizeLheading(ctx, src)) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
+    // setext heading (only when this is not a top-level pass; at the
+    // top level the paragraph below probes for it instead). The
+    // paragraph regex is the probe span here too: it covers at least
+    // the lines a setext text may span (its list interrupt is the
+    // narrow top-level one), so an underline it misses cannot be
+    // reached by a heading either.
+    if (!ctx.state.top) {
+      const cap = BLOCK.paragraph.exec(src);
+      if (cap && (O.lheadingProbe.test(cap[1]) || lheadingAfterParagraph(src, cap[0].length))) {
+        if (token = tokenizeLheading(ctx, src)) {
+          src = src.substring(token.raw.length);
+          tokens.push(token);
+          continue;
+        }
+      }
     }
 
     // top-level paragraph (only when this is a top-level pass; inside
-    // a list item the same text becomes a plain text token instead)
-    if (ctx.state.top && (token = tokenizeParagraph(ctx, src))) {
-      const lastToken = tokens.at(-1);
-      if (lastParagraphClipped && lastToken?.type === 'paragraph') {
-        lastToken.raw += (lastToken.raw.endsWith('\n') ? '' : '\n') + token.raw;
-        lastToken.text += '\n' + token.text;
-        ctx.inlineQueue.pop();
-        ctx.inlineQueue.at(-1).src = lastToken.text;
-      } else {
-        tokens.push(token);
+    // a list item the same text becomes a plain text token instead).
+    // A setext heading is a paragraph followed by an underline, so
+    // the paragraph regex runs first and the underline is probed
+    // inside its text: the lheading regex only runs when an underline
+    // line is present, or when the paragraph stopped at an html line
+    // a setext text may cross.
+    if (ctx.state.top) {
+      const cap = BLOCK.paragraph.exec(src);
+      if (cap) {
+        let lh;
+        if (O.lheadingProbe.test(cap[1]) || lheadingAfterParagraph(src, cap[0].length)) {
+          lh = tokenizeLheading(ctx, src);
+        }
+        if (lh) {
+          src = src.substring(lh.raw.length);
+          tokens.push(lh);
+          continue;
+        }
+        const token = paragraphToken(ctx, cap);
+        const lastToken = tokens.at(-1);
+        if (lastParagraphClipped && lastToken?.type === 'paragraph') {
+          lastToken.raw += (lastToken.raw.endsWith('\n') ? '' : '\n') + token.raw;
+          lastToken.text += '\n' + token.text;
+          ctx.inlineQueue.pop();
+          ctx.inlineQueue.at(-1).src = lastToken.text;
+        } else {
+          tokens.push(token);
+        }
+        src = src.substring(token.raw.length);
+        continue;
       }
-      src = src.substring(token.raw.length);
-      continue;
     }
 
     // plain text
@@ -1320,7 +1464,17 @@ function blockTokens(ctx, src, tokens = [], lastParagraphClipped = false) {
 /* Inline tokenizers                                                   */
 /* ------------------------------------------------------------------ */
 
-function outputLink(ctx, cap, link, raw) {
+/** The HTML for a checkbox token. */
+function checkboxHtml(checked) {
+  return '<input ' + (checked ? 'checked="" ' : '') + 'disabled="" type="checkbox"> ';
+}
+
+/** Render an inline link or image into `out`. Returns the number of
+ *  source characters consumed, or 0 when the link bails (a link may
+ *  not contain another link, so the caller falls through to plain
+ *  text and the inner link is the one kept). `textMode` renders only
+ *  the textual part, as an image's alt text needs. */
+function appendLink(ctx, cap, link, raw, out, textMode) {
   const href = link.href;
   const title = link.title || null;
   const text = cap[1].replace(O.outputLinkReplace, '$1');
@@ -1331,27 +1485,54 @@ function outputLink(ctx, cap, link, raw) {
   const outerInRawBlock = ctx.state.inRawBlock;
   ctx.state.inLink = true;
   ctx.state.linkEmitted = false;
-  const tokens = inlineTokens(ctx, text);
+  // A link's label renders as HTML; an image's label renders as plain
+  // text for its alt attribute.
+  const inner = inlineToHtml(ctx, text, isImage);
   const textHasLink = ctx.state.linkEmitted;
   ctx.state.linkEmitted = outerLinkEmitted;
   ctx.state.inLink = outerInLink;
 
   if (!isImage) {
-    // Links may not contain other links, at any level of nesting. Bail
-    // so the caller falls through to plain text and the inner link is
-    // the one kept. Images are exempt: their text is flattened into an
-    // alt attribute.
+    // Links may not contain other links, at any level of nesting.
     if (textHasLink) {
-      // These tokens are discarded, so undo the raw-block state they
+      // This rendering is discarded, so undo the raw-block state it
       // opened; leaving it set would suppress escaping for the text
       // that is re-scanned.
       ctx.state.inRawBlock = outerInRawBlock;
-      return;
+      return 0;
     }
     ctx.state.linkEmitted = true;
+    if (textMode) {
+      out.push(inner);
+      return raw.length;
+    }
+    const cleanHref = cleanUrl(href);
+    if (cleanHref === null) {
+      out.push(inner);
+      return raw.length;
+    }
+    let s = '<a href="' + escapeHtml(cleanHref, false) + '"';
+    if (title) s += ' title="' + escapeHtml(title) + '"';
+    s += '>' + inner + '</a>';
+    out.push(s);
+    return raw.length;
   }
 
-  return { type: isImage ? 'image' : 'link', raw, href, title, text, tokens };
+  // Image: the label became the alt text.
+  if (textMode) {
+    out.push(inner);
+    return raw.length;
+  }
+  const cleanHref = cleanUrl(href);
+  if (cleanHref === null) {
+    out.push(escapeHtml(inner));
+    return raw.length;
+  }
+  let s = `<img src="${escapeHtml(cleanHref)}" alt="${escapeHtml(inner)}"`;
+  if (title) s += ` title="${escapeHtml(title)}"`;
+  s += '>';
+  out.push(s);
+  return raw.length;
 }
 
 function isLabelEndInsideToken(ctx, src, label, labelStart) {
@@ -1378,51 +1559,50 @@ function isLabelEndInsideToken(ctx, src, label, labelStart) {
   return false;
 }
 
-function tokenizeEscape(ctx, src) {
+function appendEscape(ctx, src, out, textMode) {
   const cap = INLINE.escape.exec(src);
-  if (cap) return { type: 'escape', raw: cap[0], text: cap[1] };
+  if (cap) {
+    out.push(textMode ? cap[1] : escapeHtml(cap[1]));
+    return cap[0].length;
+  }
+  return 0;
 }
 
-function tokenizeTag(ctx, src) {
+function appendTag(ctx, src, out, textMode) {
   const cap = INLINE.tag.exec(src);
   if (cap) {
     if (!ctx.state.inLink && O.startATag.test(cap[0])) ctx.state.inLink = true;
     else if (ctx.state.inLink && O.endATag.test(cap[0])) ctx.state.inLink = false;
     if (!ctx.state.inRawBlock && O.startPreScriptTag.test(cap[0])) ctx.state.inRawBlock = true;
     else if (ctx.state.inRawBlock && O.endPreScriptTag.test(cap[0])) ctx.state.inRawBlock = false;
-    return {
-      type: 'html',
-      raw: cap[0],
-      inLink: ctx.state.inLink,
-      inRawBlock: ctx.state.inRawBlock,
-      block: false,
-      text: cap[0],
-    };
+    out.push(cap[0]);
+    return cap[0].length;
   }
+  return 0;
 }
 
-function tokenizeLink(ctx, src) {
+function appendLinkToken(ctx, src, out, textMode) {
   // The link regex backtracks quadratically over unterminated-link
-  // inputs like '[a](b'.repeat(n). inlineTokens anchors one paren scan
+  // inputs like '[a](b'.repeat(n). inlineToHtml anchors one paren scan
   // per run in state.linkParenPossible; when it is false the regex
   // cannot match, so bail out before running it.
-  if (ctx.state.linkParenPossible === false) return;
+  if (ctx.state.linkParenPossible === false) return 0;
   const cap = INLINE.link.exec(src);
   if (cap) {
     const labelStart = cap[0].charAt(0) === '!' ? 2 : 1;
-    if (isLabelEndInsideToken(ctx, src, cap[1], labelStart)) return;
+    if (isLabelEndInsideToken(ctx, src, cap[1], labelStart)) return 0;
 
     const trimmedUrl = cap[2].trim();
     if (O.startAngleBracket.test(trimmedUrl)) {
       // CommonMark requires matching angle brackets.
-      if (!O.endAngleBracket.test(trimmedUrl)) return;
+      if (!O.endAngleBracket.test(trimmedUrl)) return 0;
       // The ending angle bracket cannot be escaped.
       const rtrimSlash = rtrim(trimmedUrl.slice(0, -1), '\\');
-      if ((trimmedUrl.length - rtrimSlash.length) % 2 === 0) return;
+      if ((trimmedUrl.length - rtrimSlash.length) % 2 === 0) return 0;
     } else {
       // Find the closing parenthesis.
       const lastParenIndex = findClosingBracket(cap[2], '()');
-      if (lastParenIndex === -2) return; // more open parens than closed
+      if (lastParenIndex === -2) return 0; // more open parens than closed
       if (lastParenIndex > -1) {
         const start = cap[0].indexOf('!') === 0 ? 5 : 4;
         const linkLen = start + cap[1].length + lastParenIndex;
@@ -1435,31 +1615,34 @@ function tokenizeLink(ctx, src) {
     // not escaped. `[foo](/url\)` has no closer; that paren is
     // destination text.
     const unescaped = rtrim(cap[0].slice(0, -1), '\\');
-    if ((cap[0].length - unescaped.length) % 2 === 0) return;
+    if ((cap[0].length - unescaped.length) % 2 === 0) return 0;
 
     let href = cap[2];
     let title = cap[3] ? cap[3].slice(1, -1) : '';
     href = href.trim();
     if (O.startAngleBracket.test(href)) href = href.slice(1, -1);
-    return outputLink(ctx, cap, {
+    return appendLink(ctx, cap, {
       href: href ? href.replace(INLINE.anyPunctuation, '$1') : href,
       title: title ? title.replace(INLINE.anyPunctuation, '$1') : title,
-    }, cap[0]);
+    }, cap[0], out, textMode);
   }
+  return 0;
 }
 
-function tokenizeReflink(ctx, src) {
+function appendReflink(ctx, src, out, textMode) {
   let cap;
   if ((cap = INLINE.reflink.exec(src)) || (cap = INLINE.nolink.exec(src))) {
     const labelStart = cap[0].charAt(0) === '!' ? 2 : 1;
-    if (isLabelEndInsideToken(ctx, src, cap[1], labelStart)) return;
+    if (isLabelEndInsideToken(ctx, src, cap[1], labelStart)) return 0;
     const link = ctx.tokens.links[normalizeLabel(cap[2] || cap[1])];
     if (!link) {
-      const text = cap[0].charAt(0);
-      return { type: 'text', raw: text, text };
+      // Not a defined reference: only the opening character is text.
+      out.push(cap[0].charAt(0));
+      return 1;
     }
-    return outputLink(ctx, cap, link, cap[0]);
+    return appendLink(ctx, cap, link, cap[0], out, textMode);
   }
+  return 0;
 }
 
 function lastPossibleEmStrongCloser(ctx, maskedSrc, delim) {
@@ -1474,10 +1657,10 @@ function lastPossibleDelCloser(ctx, maskedSrc) {
   return scanClosers(maskedSrc).lastDel;
 }
 
-function tokenizeEmStrong(ctx, src, maskedSrc, prevChar = '') {
+function appendEmStrong(ctx, src, maskedSrc, prevChar, out, textMode) {
   let match = INLINE.emStrongLDelim.exec(src);
-  if (!match) return;
-  if (!match[1] && !match[2] && !match[3] && !match[4]) return;
+  if (!match) return 0;
+  if (!match[1] && !match[2] && !match[3] && !match[4]) return 0;
 
   const delimChar = match[0][0];
   // A mid-run opener (for example the second star of an unmatched `**`)
@@ -1499,7 +1682,7 @@ function tokenizeEmStrong(ctx, src, maskedSrc, prevChar = '') {
   const prevPunct = runStart < srcStart ? runPrevPunct : !!INLINE.punctuation.exec(prevChar);
 
   // `_` cannot open between two alphanumerics.
-  if (match[4] && prevChar.match(O.unicodeAlphaNumeric)) return;
+  if (match[4] && prevChar.match(O.unicodeAlphaNumeric)) return 0;
 
   const nextChar = match[1] || match[3] || '';
 
@@ -1514,11 +1697,11 @@ function tokenizeEmStrong(ctx, src, maskedSrc, prevChar = '') {
     const runLength = srcStart - runStart + lLength;
     const openerCanClose = !!runPrevChar.trim()
       && (!!nextChar || (delimChar === '*' && !runPrevPunct));
-    if (delimChar !== '*' && delimChar !== '_') return;
+    if (delimChar !== '*' && delimChar !== '_') return 0;
     const endReg = delimChar === '*' ? INLINE.emStrongRDelimAst : INLINE.emStrongRDelimUnd;
     const lastPossible = lastPossibleEmStrongCloser(ctx, maskedSrc, delimChar);
     const windowStart = maskedSrc.length - src.length + lLength;
-    if (lastPossible < windowStart) return;
+    if (lastPossible < windowStart) return 0;
     // Clip maskedSrc to the same section of string as src.
     maskedSrc = maskedSrc.slice(-1 * src.length + lLength);
     const lastPossibleInWindow = lastPossible - windowStart;
@@ -1559,35 +1742,46 @@ function tokenizeEmStrong(ctx, src, maskedSrc, prevChar = '') {
 
       if (Math.min(lLength, rLength) % 2) {
         // Odd smallest delimiter: emphasis.
-        const text = raw.slice(1, -1);
-        return { type: 'em', raw, text, tokens: inlineTokens(ctx, text) };
+        const inner = inlineToHtml(ctx, raw.slice(1, -1), textMode);
+        if (textMode) out.push(inner);
+        else out.push(`<em>${inner}</em>`);
+        return raw.length;
       }
       // Even smallest delimiter: strong emphasis.
-      const text = raw.slice(2, -2);
-      return { type: 'strong', raw, text, tokens: inlineTokens(ctx, text) };
+      const inner = inlineToHtml(ctx, raw.slice(2, -2), textMode);
+      if (textMode) out.push(inner);
+      else out.push(`<strong>${inner}</strong>`);
+      return raw.length;
     }
   }
+  return 0;
 }
 
-function tokenizeCodespan(ctx, src) {
+function appendCodespan(ctx, src, out, textMode) {
   const cap = INLINE.code.exec(src);
   if (cap) {
     let text = cap[2].replace(O.newLineCharGlobal, ' ');
     const hasNonSpaceChars = O.nonSpaceChar.test(text);
     const hasSpaceCharsOnBothEnds = O.startingSpaceChar.test(text) && O.endingSpaceChar.test(text);
     if (hasNonSpaceChars && hasSpaceCharsOnBothEnds) text = text.substring(1, text.length - 1);
-    return { type: 'codespan', raw: cap[0], text };
+    out.push(textMode ? text : `<code>${escapeHtml(text, true)}</code>`);
+    return cap[0].length;
   }
+  return 0;
 }
 
-function tokenizeBr(ctx, src) {
+function appendBr(ctx, src, out, textMode) {
   const cap = INLINE.br.exec(src);
-  if (cap) return { type: 'br', raw: cap[0] };
+  if (cap) {
+    out.push(textMode ? '' : '<br>');
+    return cap[0].length;
+  }
+  return 0;
 }
 
-function tokenizeDel(ctx, src, maskedSrc, prevChar = '') {
+function appendDel(ctx, src, maskedSrc, prevChar, out, textMode) {
   let match = INLINE.delLDelim.exec(src);
-  if (!match) return;
+  if (!match) return 0;
   const nextChar = match[1] || '';
   if (!nextChar || !prevChar || INLINE.punctuation.exec(prevChar)) {
     const lLength = [...match[0]].length - 1;
@@ -1595,7 +1789,7 @@ function tokenizeDel(ctx, src, maskedSrc, prevChar = '') {
     const endReg = INLINE.delRDelim;
     const lastPossible = lastPossibleDelCloser(ctx, maskedSrc);
     const windowStart = maskedSrc.length - src.length + lLength;
-    if (lastPossible < windowStart) return;
+    if (lastPossible < windowStart) return 0;
     maskedSrc = maskedSrc.slice(-1 * src.length + lLength);
     const lastPossibleInWindow = lastPossible - windowStart;
     endReg.lastIndex = 0;
@@ -1616,13 +1810,16 @@ function tokenizeDel(ctx, src, maskedSrc, prevChar = '') {
       rLength = Math.min(rLength, rLength + delimTotal);
       const lastCharLength = [...match[0]][0].length;
       const raw = src.slice(0, lLength + match.index + lastCharLength + rLength);
-      const text = raw.slice(lLength, -lLength);
-      return { type: 'del', raw, text, tokens: inlineTokens(ctx, text) };
+      const inner = inlineToHtml(ctx, raw.slice(lLength, -lLength), textMode);
+      if (textMode) out.push(inner);
+      else out.push(`<del>${inner}</del>`);
+      return raw.length;
     }
   }
+  return 0;
 }
 
-function tokenizeAutolink(ctx, src) {
+function appendAutolink(ctx, src, out, textMode) {
   const cap = INLINE.autolink.exec(src);
   if (cap) {
     let text, href;
@@ -1633,18 +1830,22 @@ function tokenizeAutolink(ctx, src) {
       text = cap[1];
       href = text;
     }
-    return {
-      type: 'link',
-      raw: cap[0],
-      text,
-      href,
-      autolink: true,
-      tokens: [{ type: 'text', raw: text, text }],
-    };
+    if (textMode) {
+      out.push(text);
+      return cap[0].length;
+    }
+    const cleanHref = cleanUrl(href);
+    if (cleanHref === null) {
+      out.push(escapeHtml(text, true));
+      return cap[0].length;
+    }
+    out.push('<a href="' + escapeHtml(cleanHref, true) + '">' + escapeHtml(text, true) + '</a>');
+    return cap[0].length;
   }
+  return 0;
 }
 
-function tokenizeUrl(ctx, src) {
+function appendUrl(ctx, src, out, textMode) {
   let cap;
   if (cap = INLINE.url.exec(src)) {
     let text, href;
@@ -1662,30 +1863,64 @@ function tokenizeUrl(ctx, src) {
       text = cap[0];
       href = cap[1] === 'www.' ? 'http://' + cap[0] : cap[0];
     }
-    return {
-      type: 'link',
-      raw: cap[0],
-      text,
-      href,
-      autolink: true,
-      tokens: [{ type: 'text', raw: text, text }],
-    };
+    if (textMode) {
+      out.push(text);
+      return cap[0].length;
+    }
+    const cleanHref = cleanUrl(href);
+    if (cleanHref === null) {
+      out.push(escapeHtml(text, true));
+      return cap[0].length;
+    }
+    out.push('<a href="' + escapeHtml(cleanHref, true) + '">' + escapeHtml(text, true) + '</a>');
+    return cap[0].length;
   }
+  return 0;
 }
 
-function tokenizeInlineText(ctx, src) {
-  const cap = INLINE.text.exec(src);
-  if (cap) {
-    const escaped = ctx.state.inRawBlock;
-    return {
-      type: 'text',
-      raw: cap[0],
-      // Raw HTML keeps whatever it was written with; everywhere else a
-      // numeric character reference stands for the character itself.
-      text: escaped ? cap[0] : decodeNumericRefs(cap[0]),
-      escaped,
-    };
+/** Length of the plain-text run at the start of `src`, per the
+ *  inline text rule: the first unit (a backtick run, a tilde run, or
+ *  one character), then up to the earliest stop — a special character
+ *  (`\ < ! [ ` * ~ _`), a URL scheme, a `www.` with a valid start, a
+ *  `  \n` hard-break run, a `mailto:`/`xmpp:` (the character before
+ *  it belongs to the text), an email address (same), or the end. */
+function inlineTextLength(src) {
+  const c0 = src.charCodeAt(0);
+  const isAlnum = (c0 >= 48 && c0 <= 57) || (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122);
+  // A single non-alphanumeric character followed by mailto:/xmpp: is
+  // the whole text.
+  if (!isAlnum && (src.startsWith('mailto:', 1) || src.startsWith('xmpp:', 1))) return 1;
+  // First unit: a backtick run, a tilde run, or one character.
+  let start = 1;
+  if (c0 === 96) {
+    while (src.charCodeAt(start) === 96) start++;
+  } else if (c0 === 126) {
+    while (src.charCodeAt(start) === 126) start++;
   }
+  // An email address starting right after the first unit ends the
+  // text there. (The other immediate stops — a backtick, a tilde, a
+  // hard-break run — are found by the scan below.)
+  INLINE_EMAIL_START.lastIndex = start;
+  if (INLINE_EMAIL_START.test(src)) return start;
+  INLINE_TEXT_STOP.lastIndex = start;
+  const m = INLINE_TEXT_STOP.exec(src);
+  if (!m) return src.length;
+  if (m[1] !== undefined || m[2] !== undefined || m[3] !== undefined || m[0] === '') return m.index;
+  return m.index + 1;
+}
+
+function appendInlineText(ctx, src, out, textMode) {
+  const len = inlineTextLength(src);
+  if (len > 0) {
+    // A raw-text entry, not yet decoded or escaped: adjacent text
+    // tokens are merged before escaping (see renderInlineOut), so a
+    // `&` split from its reference by a `_` is still one reference.
+    // `e` records whether the run sits inside raw HTML, which keeps
+    // whatever it was written with.
+    out.push({ t: src.slice(0, len), e: ctx.state.inRawBlock });
+    return len;
+  }
+  return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1774,23 +2009,17 @@ function maskSrc(ctx, src) {
 /* Inline loop                                                         */
 /* ------------------------------------------------------------------ */
 
-function inlineTokens(ctx, src, tokens = []) {
-  // One paren scan per inline run, shared with tokenizeLink: without a
-  // ')' ahead the link regex cannot match. A nested run receives a
-  // substring of the outer run, so if the outer had no ')' neither does
-  // this substring.
+/** Render an inline string to HTML directly, without building an
+ *  intermediate token tree. `textMode` renders only the textual part
+ *  (image alt text: links become their label, code spans their raw
+ *  text, hard breaks disappear). Returns the HTML string. */
+function inlineToHtml(ctx, src, textMode) {
+  // One paren scan per inline run, shared with appendLinkToken:
+  // without a ')' ahead the link regex cannot match. A nested run
+  // receives a substring of the outer run, so if the outer had no ')'
+  // neither does this substring.
   const prevLinkParenPossible = ctx.state.linkParenPossible;
   ctx.state.linkParenPossible = prevLinkParenPossible && src.includes(')');
-  try {
-    return inlineTokensInner(ctx, src, tokens);
-  } finally {
-    // A nested run anchored on its own substring; restore the outer
-    // run's flag for the rest of its loop.
-    ctx.state.linkParenPossible = prevLinkParenPossible;
-  }
-}
-
-function inlineTokensInner(ctx, src, tokens) {
   // The masked source is only read by emStrong and del, which need a
   // `*`, `_` or `~` to start. Skip building it for a run without one.
   const maskedSrc = (src.includes('*') || src.includes('_') || src.includes('~'))
@@ -1802,13 +2031,51 @@ function inlineTokensInner(ctx, src, tokens) {
   // when the pass ends so the source is not retained.
   ctx.closerStack.push(scanClosers(maskedSrc));
   try {
-    return tokenizeInlines(ctx, src, maskedSrc, tokens);
+    const out = [];
+    appendInline(ctx, src, maskedSrc, out, textMode);
+    return renderInlineOut(out, textMode);
   } finally {
     ctx.closerStack.pop();
+    // A nested run anchored on its own substring; restore the outer
+    // run's flag for the rest of its loop.
+    ctx.state.linkParenPossible = prevLinkParenPossible;
   }
 }
 
-function tokenizeInlines(ctx, src, maskedSrc, tokens) {
+/** Join an inline output array. String entries are finished HTML and
+ *  pass through as they are. Object entries are raw text runs, and
+ *  adjacent runs are merged before decoding and escaping — that is
+ *  what marked does with adjacent text tokens, and it is what keeps
+ *  a `&` followed by `_;` from being escaped when a `_` split the
+ *  text in two. Adjacent runs always share their raw-block state (a
+ *  tag, which is what changes it, is a string entry that flushes),
+ *  but a changed state flushes anyway, to be safe. */
+function renderInlineOut(out, textMode) {
+  let result = '';
+  let pending = '';
+  let pendingEscaped = false;
+  const flush = () => {
+    if (pending !== '') {
+      const text = pendingEscaped ? pending : decodeNumericRefs(pending);
+      result += textMode ? text : (pendingEscaped ? text : escapeHtml(text));
+      pending = '';
+    }
+  };
+  for (const item of out) {
+    if (typeof item === 'string') {
+      flush();
+      result += item;
+    } else {
+      if (pending !== '' && pendingEscaped !== item.e) flush();
+      pending += item.t;
+      pendingEscaped = item.e;
+    }
+  }
+  flush();
+  return result;
+}
+
+function appendInline(ctx, src, maskedSrc, out, textMode) {
   let keepPrevChar = false;
   let prevChar = '';
   let srcLength = Infinity;
@@ -1823,73 +2090,65 @@ function tokenizeInlines(ctx, src, maskedSrc, tokens) {
     if (!keepPrevChar) prevChar = '';
     keepPrevChar = false;
 
-    let token;
+    let consumed = 0;
     const ch = src.charCodeAt(0);
 
-    // Dispatch on the first character: only the tokenizers that can
+    // Dispatch on the first character: only the renderers that can
     // possibly match there are tried, in the reference order. Plain
     // text (the common case) falls straight through to the text rule.
     if (ch === 92) { // backslash
-      if (token = tokenizeEscape(ctx, src)) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
+      if (consumed = appendEscape(ctx, src, out, textMode)) {
+        src = src.substring(consumed);
         continue;
       }
-      if (token = tokenizeBr(ctx, src)) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
+      if (consumed = appendBr(ctx, src, out, textMode)) {
+        src = src.substring(consumed);
         continue;
       }
     } else if (ch === 60) { // <
-      if (token = tokenizeTag(ctx, src)) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
+      if (consumed = appendTag(ctx, src, out, textMode)) {
+        src = src.substring(consumed);
         continue;
       }
-      if (token = tokenizeAutolink(ctx, src)) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
+      if (consumed = appendAutolink(ctx, src, out, textMode)) {
+        src = src.substring(consumed);
         continue;
       }
     } else if (ch === 91 || ch === 33) { // [ or !
-      if (token = tokenizeLink(ctx, src)) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
+      if (consumed = appendLinkToken(ctx, src, out, textMode)) {
+        src = src.substring(consumed);
         continue;
       }
-      if (token = tokenizeReflink(ctx, src)) {
-        src = src.substring(token.raw.length);
-        const lastToken = tokens.at(-1);
-        if (token.type === 'text' && lastToken?.type === 'text') {
-          lastToken.raw += token.raw;
-          lastToken.text += token.text;
-        } else {
-          tokens.push(token);
-        }
+      if (consumed = appendReflink(ctx, src, out, textMode)) {
+        src = src.substring(consumed);
         continue;
       }
     } else if (ch === 42 || ch === 95) { // * or _
-      if (token = tokenizeEmStrong(ctx, src, maskedSrc, prevChar)) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
+      if (consumed = appendEmStrong(ctx, src, maskedSrc, prevChar, out, textMode)) {
+        src = src.substring(consumed);
+        continue;
+      }
+      // `_` can start an extended autolink (an email address, whose
+      // local part includes `_`); `*` cannot, so only `_` falls
+      // through to it before plain text.
+      if (ch === 95 && !ctx.state.inLink
+        && (consumed = appendUrl(ctx, src, out, textMode))) {
+        src = src.substring(consumed);
         continue;
       }
     } else if (ch === 96) { // `
-      if (token = tokenizeCodespan(ctx, src)) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
+      if (consumed = appendCodespan(ctx, src, out, textMode)) {
+        src = src.substring(consumed);
         continue;
       }
     } else if (ch === 126) { // ~
-      if (token = tokenizeDel(ctx, src, maskedSrc, prevChar)) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
+      if (consumed = appendDel(ctx, src, maskedSrc, prevChar, out, textMode)) {
+        src = src.substring(consumed);
         continue;
       }
     } else if (ch === 32) { // space
-      if (token = tokenizeBr(ctx, src)) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
+      if (consumed = appendBr(ctx, src, out, textMode)) {
+        src = src.substring(consumed);
         continue;
       }
     } else if (!ctx.state.inLink
@@ -1898,26 +2157,18 @@ function tokenizeInlines(ctx, src, maskedSrc, tokens) {
         || (ch >= 65 && ch <= 90) // A-Z
         || (ch >= 97 && ch <= 122))) { // a-z
       // Only these first characters can start an extended autolink.
-      if (token = tokenizeUrl(ctx, src)) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
+      if (consumed = appendUrl(ctx, src, out, textMode)) {
+        src = src.substring(consumed);
         continue;
       }
     }
 
     // plain text
-    if (token = tokenizeInlineText(ctx, src)) {
-      src = src.substring(token.raw.length);
+    if (consumed = appendInlineText(ctx, src, out, textMode)) {
       // Track prevChar before a run of ____ started.
-      if (token.raw.slice(-1) !== '_') prevChar = token.raw.slice(-1);
+      if (src.charAt(consumed - 1) !== '_') prevChar = src.charAt(consumed - 1);
+      src = src.substring(consumed);
       keepPrevChar = true;
-      const lastToken = tokens.at(-1);
-      if (lastToken?.type === 'text') {
-        lastToken.raw += token.raw;
-        lastToken.text += token.text;
-      } else {
-        tokens.push(token);
-      }
       continue;
     }
 
@@ -1926,119 +2177,28 @@ function tokenizeInlines(ctx, src, maskedSrc, tokens) {
       break;
     }
   }
-
-  return tokens;
 }
 
 /* ------------------------------------------------------------------ */
 /* Rendering                                                           */
 /*                                                                     */
-/* Two renderers share the same walk: the normal one emits HTML, the   */
-/* text one (used for image alt text) emits only the textual part.     */
+/* Inline strings are rendered directly to HTML during the inline      */
+/* phase and stored on their block token's `html` field (or a table    */
+/* cell's `html` field); the block renderer only assembles those       */
+/* strings with the block-level tags.                                  */
 /* ------------------------------------------------------------------ */
 
-function renderTextToken(token, textMode) {
-  if ('tokens' in token && token.tokens) return renderInline(token.tokens, textMode);
-  if ('escaped' in token && token.escaped) return token.text;
-  return textMode ? token.text : escapeHtml(token.text);
-}
-
-function renderInline(tokens, textMode) {
-  let out = '';
-  for (const token of tokens) {
-    switch (token.type) {
-      case 'escape':
-        out += textMode ? token.text : escapeHtml(token.text);
-        break;
-      case 'html':
-        out += token.text;
-        break;
-      case 'link': {
-        if (textMode) {
-          out += token.tokens ? renderInline(token.tokens, true) : token.text;
-          break;
-        }
-        // References are not resolved inside an autolink, so every `&`
-        // there is literal. Elsewhere only an `&` that cannot start a
-        // reference needs escaping.
-        const parsedText = token.autolink
-          ? escapeHtml(token.text, true)
-          : renderInline(token.tokens);
-        const cleanHref = cleanUrl(token.href);
-        if (cleanHref === null) {
-          out += parsedText;
-          break;
-        }
-        let href = escapeHtml(cleanHref, token.autolink);
-        let link = '<a href="' + href + '"';
-        if (token.title) link += ' title="' + escapeHtml(token.title) + '"';
-        link += '>' + parsedText + '</a>';
-        out += link;
-        break;
-      }
-      case 'image': {
-        let alt = token.text;
-        if (token.tokens) alt = renderInline(token.tokens, true);
-        if (textMode) {
-          out += alt;
-          break;
-        }
-        const cleanHref = cleanUrl(token.href);
-        if (cleanHref === null) {
-          out += escapeHtml(alt);
-          break;
-        }
-        let img = `<img src="${escapeHtml(cleanHref)}" alt="${escapeHtml(alt)}"`;
-        if (token.title) img += ` title="${escapeHtml(token.title)}"`;
-        img += '>';
-        out += img;
-        break;
-      }
-      case 'checkbox':
-        out += textMode ? token.raw : '<input ' + (token.checked ? 'checked="" ' : '') + 'disabled="" type="checkbox"> ';
-        break;
-      case 'strong':
-        out += textMode
-          ? (token.tokens ? renderInline(token.tokens, true) : token.text)
-          : `<strong>${renderInline(token.tokens)}</strong>`;
-        break;
-      case 'em':
-        out += textMode
-          ? (token.tokens ? renderInline(token.tokens, true) : token.text)
-          : `<em>${renderInline(token.tokens)}</em>`;
-        break;
-      case 'codespan':
-        out += textMode ? token.text : `<code>${escapeHtml(token.text, true)}</code>`;
-        break;
-      case 'br':
-        out += textMode ? '' : '<br>';
-        break;
-      case 'del':
-        out += textMode
-          ? (token.tokens ? renderInline(token.tokens, true) : token.text)
-          : `<del>${renderInline(token.tokens)}</del>`;
-        break;
-      case 'text':
-        out += renderTextToken(token, textMode);
-        break;
-      default:
-        throw new Error('Token with "' + token.type + '" type was not found.');
-    }
-  }
-  return out;
-}
-
 function renderBlock(tokens) {
-  let out = '';
+  const out = [];
   for (const token of tokens) {
     switch (token.type) {
       case 'space':
         break;
       case 'hr':
-        out += '<hr>\n';
+        out.push('<hr>\n');
         break;
       case 'heading':
-        out += `<h${token.depth}>${renderInline(token.tokens)}</h${token.depth}>\n`;
+        out.push(`<h${token.depth}>${token.html}</h${token.depth}>\n`);
         break;
       case 'code': {
         const langString = (token.lang || '').match(O.notSpaceStart)?.[0];
@@ -2046,10 +2206,10 @@ function renderBlock(tokens) {
         // newline.
         const code = token.text ? token.text.replace(O.endingNewline, '') + '\n' : '';
         if (!langString) {
-          out += '<pre><code>' + escapeHtml(code, true) + '</code></pre>\n';
+          out.push('<pre><code>' + escapeHtml(code, true) + '</code></pre>\n');
         } else {
-          out += '<pre><code class="language-' + escapeHtml(langString) + '">'
-            + escapeHtml(code, true) + '</code></pre>\n';
+          out.push('<pre><code class="language-' + escapeHtml(langString) + '">'
+            + escapeHtml(code, true) + '</code></pre>\n');
         }
         break;
       }
@@ -2065,62 +2225,63 @@ function renderBlock(tokens) {
           body += `<tr>\n${cell}</tr>\n`;
         }
         if (body) body = `<tbody>${body}</tbody>`;
-        out += '<table>\n<thead>\n' + header + '</thead>\n' + body + '</table>\n';
+        out.push('<table>\n<thead>\n' + header + '</thead>\n' + body + '</table>\n');
         break;
       }
       case 'blockquote':
-        out += `<blockquote>\n${renderBlock(token.tokens)}</blockquote>\n`;
+        out.push(`<blockquote>\n${renderBlock(token.tokens)}</blockquote>\n`);
         break;
       case 'list': {
         let body = '';
         for (const item of token.items) body += `<li>${renderBlock(item.tokens)}</li>\n`;
         const type = token.ordered ? 'ol' : 'ul';
         const startAttr = (token.ordered && token.start !== 1) ? (' start="' + token.start + '"') : '';
-        out += '<' + type + startAttr + '>\n' + body + '</' + type + '>\n';
+        out.push('<' + type + startAttr + '>\n' + body + '</' + type + '>\n');
         break;
       }
       case 'checkbox':
-        out += '<input ' + (token.checked ? 'checked="" ' : '') + 'disabled="" type="checkbox"> ';
+        out.push(checkboxHtml(token.checked));
         break;
       case 'html':
-        out += token.text;
+        out.push(token.text);
         break;
       case 'def':
         break;
       case 'paragraph':
-        out += `<p>${renderInline(token.tokens)}</p>\n`;
+        out.push(`<p>${token.html}</p>\n`);
         break;
       case 'text':
-        out += renderTextToken(token, false);
+        out.push(token.html);
         break;
       default:
         throw new Error('Token with "' + token.type + '" type was not found.');
     }
   }
-  return out;
+  return out.join('');
 }
 
 function renderTableCell(token) {
-  const content = renderInline(token.tokens);
   const type = token.header ? 'th' : 'td';
   const tag = token.align ? `<${type} align="${token.align}">` : `<${type}>`;
-  return tag + content + `</${type}>\n`;
+  return tag + token.html + `</${type}>\n`;
 }
 
 /* ------------------------------------------------------------------ */
 /* Entry point                                                         */
 /* ------------------------------------------------------------------ */
 
-/** Lex `src` into block tokens, then tokenise the queued inline
- *  strings in order. An inline `<pre>`, `<code>`, `<kbd>` or
- *  `<script>` left open ends with the block holding it; carried over,
- *  it would stop every later block's text from being escaped. */
+/** Lex `src` into block tokens, then render the queued inline
+ *  strings in order, storing each result on its holder's `html`
+ *  field. An inline `<pre>`, `<code>`, `<kbd>` or `<script>` left
+ *  open ends with the block holding it; carried over, it would stop
+ *  every later block's text from being escaped. */
 function lex(ctx, src) {
-  src = src.replace(O.carriageReturn, '\n');
+  if (src.includes('\r')) src = src.replace(O.carriageReturn, '\n');
   blockTokens(ctx, src, ctx.tokens);
   for (const next of ctx.inlineQueue) {
     ctx.state.inRawBlock = false;
-    inlineTokens(ctx, next.src, next.tokens);
+    const lead = next.holder.leadCheckbox ? checkboxHtml(next.holder.leadCheckbox.checked) : '';
+    next.holder.html = lead + inlineToHtml(ctx, next.src, false);
   }
   ctx.inlineQueue = [];
   return ctx.tokens;
